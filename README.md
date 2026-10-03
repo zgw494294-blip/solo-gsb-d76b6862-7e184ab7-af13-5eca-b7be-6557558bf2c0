@@ -9,6 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；裁剪数据全部取自与 `expected_revision` 一致的**同一份完整源快照**——读取快照时先核对版本（不符立即 409，绝不拿错配版本裁剪），提交前在同一事务内再核对一次（读取匹配后源被修订同样 409），目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422；失败不创建目标、不改源场景或播放会话。
+- 2～4 个已保存场景可按给定顺序**拼接（concat）为连续播放场景**：`POST /scenes/concat` 接收非空 `target_scene_id` 与 2～4 段（每段给出非空 `scene_id`、正整数 `expected_revision` 与正整数 `duration_ms`，同源可重复，整数拒绝布尔值和字符串）；各源轨道数须相同，每段时长不得小于该源字幕的最大 `end_ms`，拼接后字幕总数 ≤ 12。字幕起止时间加上之前各段时长之和，按段序、源顺序排列，id 为“段号:段内序号”（均从 1 起），speaker 不变，源实际分轨写入 `locked_track`，`changes` 按拼接后同说话人时间相邻字幕计算（跨段相邻计入）。读取与提交时均核对全部源版本，**提交核对和目标创建在同一事务内一同生效**：源不存在 404、版本不符或目标已占用 409、其余非法输入 422；失败不留目标、不改源及播放会话。成功保存为版本 1 并返回完整场景，可直接用原读取、修订及播放接口操作。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 
 ## 一条命令启动
@@ -580,6 +581,215 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
 
 片段时间轴从 0 开始：s1 在 100 毫秒退出与 s3 在 100 毫秒进入同刻，按既有规则**先退出后进入**；s1、s2 在 0 毫秒已活动，其进入事件由创建会话的响应快照确定，事件流不补发。片段还可以按 `expected_revision: 1` 用 `PUT /scenes/scene-clip-1` 继续修订（成功后 revision 2），与源场景互不影响。
 
+## 场景拼接（concat）：按给定顺序拼成连续播放场景
+
+2～4 个已保存场景可以按给定顺序**拼接为一个连续播放的新场景**：`POST /scenes/concat`。每一段在连续时间轴上占用 `duration_ms` 毫秒，段内字幕整体平移到“之前各段时长之和”之后；拼接结果保存为 **revision 1** 的全新场景，全部源场景与任何播放会话都不受影响。
+
+请求体字段：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `target_scene_id` | string | 拼接结果的新场景 id，**非空且尚未被占用**（不能与已有场景同名，包括与某个源同名） |
+| `segments` | array | **2～4 段**，数组顺序即播放顺序 |
+| `segments[].scene_id` | string | 本段引用的已保存场景 id，**非空**；同一个源可以重复出现 |
+| `segments[].expected_revision` | int | **正整数**。所依据的该源当前版本；**布尔值与字符串一律 422 拒绝**（不做隐式转换） |
+| `segments[].duration_ms` | int | **正整数**。本段在连续播放时间轴上占用的毫秒数，**不得小于该源字幕的最大 `end_ms`**；同样拒绝布尔值与字符串 |
+
+拼接规则：
+
+- 字幕起止时间**加上之前各段 `duration_ms` 之和**（第 1 段偏移 0，第 2 段偏移第 1 段时长，以此类推），按**段序、段内源顺序**排列。
+- 新 id 恒为字符串 **“段号:段内序号”**（均从 1 起，如 `1:1`、`1:2`、`2:1`）；`speaker` 沿用源字幕不变。
+- 每个源场景为每条字幕求出的**实际轨道写入拼接字幕的 `locked_track`**，目标沿用各源共同的 **`track_count`** 与既有最少换轨、并列规则重新求解——各源分轨平移后仍互不冲突且与锁定一致，因此拼接结果的 `assignments` 与各源画面轨道**逐一相同**。
+- **`changes` 按拼接后的时间轴重新计算**：同一说话人按时间相邻的两条字幕（含跨段相邻）换轨次数总和。各段时长允许大于内容时长（段尾留静音）。
+- 跨源合法性：**各源 `track_count` 必须相同**；**每段 `duration_ms` 不得小于该源字幕的最大 `end_ms`**；**拼接后字幕总数 ≤ 12**（每源本身 1～12 条）。任一不满足返回 422。
+
+状态码：
+
+- **200**：拼接成功，返回 revision 1 的完整场景快照。
+- **404**：按段序读取时任一源场景不存在（不创建目标）。
+- **409**：任一源的 `expected_revision` 与其当前版本不一致（源被并发修订；同源重复时每一次出现都单独核对）；或 `target_scene_id` 已被占用。拼接所用的字幕与源分轨**全部取自与各段 `expected_revision` 一致的同一份完整快照**，版本核对分两道：**读取各源快照时**按段序先核对（不存在立即 404、不符立即 409）；**提交时**在同一个 `BEGIN IMMEDIATE` 事务内再核对**全部源版本**并占用目标——**提交核对与目标创建一同生效**，覆盖“读取匹配后、提交前任一源被修订”的窗口。失败不留目标、不改源场景或播放会话。
+- **422**：段数不在 2～4、缺字段/空 id、版本号或时长非正整数（含布尔值/字符串/浮点）、各源轨道数不一致、某段时长小于该源最大 `end_ms`、字幕总数超过 12 等。
+
+### 示例 14：拼接两个场景（时间平移、保轨、跨段 changes）
+
+先创建两个 revision 1 的源场景：
+
+```bash
+# 源 1：Alice[0,1000)、Bob[800,3000) 锁轨 2；分轨 1/2，max_end=3000
+curl -s -X PUT http://localhost:8080/scenes/scene-cat-a \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "a1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "a2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2}
+    ]
+  }' >/dev/null
+
+# 源 2：Alice[0,1500) 与 Bob[0,1500) 重叠；分轨 Alice=1、Bob=2，max_end=1500
+curl -s -X PUT http://localhost:8080/scenes/scene-cat-b \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "b1", "speaker": "Alice", "start_ms": 0, "end_ms": 1500},
+      {"id": "b2", "speaker": "Bob",   "start_ms": 0, "end_ms": 1500}
+    ]
+  }' >/dev/null
+```
+
+按段序拼接：第 1 段占用 3000 毫秒（恰好等于源 1 的最大 `end_ms`），第 2 段占用 2000 毫秒（大于内容 1500，段尾留 500 毫秒静音）：
+
+```bash
+curl -s -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_scene_id": "scene-cat-out",
+    "segments": [
+      {"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 3000},
+      {"scene_id": "scene-cat-b", "expected_revision": 1, "duration_ms": 2000}
+    ]
+  }'
+```
+
+```json
+{
+  "scene_id": "scene-cat-out",
+  "revision": 1,
+  "track_count": 2,
+  "subtitles": [
+    {"id": "1:1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000, "locked_track": 1},
+    {"id": "1:2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "2:1", "speaker": "Alice", "start_ms": 3000, "end_ms": 4500, "locked_track": 1},
+    {"id": "2:2", "speaker": "Bob",   "start_ms": 3000, "end_ms": 4500, "locked_track": 2}
+  ],
+  "changes": 0,
+  "assignments": [
+    {"id": "1:1", "track": 1},
+    {"id": "1:2", "track": 2},
+    {"id": "2:1", "track": 1},
+    {"id": "2:2", "track": 2}
+  ],
+  "feasible": true
+}
+```
+
+要点：第 2 段字幕整体加上前一段时长 3000（`b1` 从 `[0,1500)` 变为 `[3000,4500)`）；id 变为“段号:段内序号”；各条 `locked_track` 都是源实际分轨，重算后轨道不变；Alice 的 `a1` 与 `b1`、Bob 的 `a2` 与 `b2` 分别跨段时间相邻且同轨，`changes` 为 0。源场景 `scene-cat-a`、`scene-cat-b` 均保持 revision 1 不变。拼接结果是普通场景，可直接读取、修订（`PUT` 带 `expected_revision: 1`）和播放：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-cat-out"}'
+```
+
+### 示例 15：同源重复拼接
+
+同一个源可以在 `segments` 中重复出现，每次出现都单独核对版本；段序播放同一内容两遍：
+
+```bash
+curl -s -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_scene_id": "scene-cat-repeat",
+    "segments": [
+      {"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 3000},
+      {"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 3000}
+    ]
+  }'
+```
+
+第 2 段字幕偏移 3000 毫秒，id 为 `2:1`、`2:2`。若重复出现的某一次版本填错（如源已到 revision 2 仍填 1），409 响应的 `detail.segment` 指出是第几段冲突。
+
+### 示例 16：拼接冲突与非法输入（404 / 409 / 422）
+
+**源不存在 → 404**（按段序读取时发现，不留目标）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-x",
+       "segments": [
+         {"scene_id": "no-such-scene", "expected_revision": 1, "duration_ms": 100},
+         {"scene_id": "scene-cat-a",   "expected_revision": 1, "duration_ms": 3000}
+       ]}'
+# HTTP/1.1 404 Not Found
+```
+
+**源版本不符 → 409**（下面第 2 段依据不存在的 revision 2；源被并发修订同理。`detail.segment` 指明冲突段号，`current_revision` 为该源当前版本）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-stale",
+       "segments": [
+         {"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 3000},
+         {"scene_id": "scene-cat-b", "expected_revision": 2, "duration_ms": 2000}
+       ]}'
+```
+
+```
+HTTP/1.1 409 Conflict
+```
+
+```json
+{"detail": {"message": "场景版本冲突：expected_revision 与当前版本不一致",
+            "scene_id": "scene-cat-b", "segment": 2, "current_revision": 1}}
+```
+
+**目标已被占用 → 409**（已有目标不会被覆盖，源也不变；目标与某个源同名同样 409）：
+
+```bash
+curl -s -i -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-cat-a",
+       "segments": [
+         {"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 3000},
+         {"scene_id": "scene-cat-b", "expected_revision": 1, "duration_ms": 2000}
+       ]}'
+# HTTP/1.1 409 Conflict
+# {"detail":{"message":"target_scene_id 已被占用，拼接目标必须使用新的 scene_id",
+#            "scene_id":"scene-cat-a","current_revision":1}}
+```
+
+其余非法请求一律 422（Pydantic 校验与跨源业务校验，均不落库）：
+
+```bash
+# 段数必须 2～4（下面只有 1 段）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-bad",
+       "segments": [{"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 3000}]}'
+# 422
+
+# expected_revision / duration_ms 拒绝布尔值与字符串（正整数严格校验）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-bad",
+       "segments": [
+         {"scene_id": "scene-cat-a", "expected_revision": true, "duration_ms": 3000},
+         {"scene_id": "scene-cat-b", "expected_revision": 1,    "duration_ms": 2000}
+       ]}'
+# 422
+
+# duration_ms 小于该源字幕的最大 end_ms（源 scene-cat-a 最大为 3000）
+curl -s -i -X POST http://localhost:8080/scenes/concat \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id": "scene-bad",
+       "segments": [
+         {"scene_id": "scene-cat-a", "expected_revision": 1, "duration_ms": 2999},
+         {"scene_id": "scene-cat-b", "expected_revision": 1, "duration_ms": 2000}
+       ]}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"message":"duration_ms 不得小于该源场景字幕的最大 end_ms",
+#            "segment":1,"duration_ms":2999,"max_end_ms":3000}}
+
+# 各源轨道数不一致 / 拼接后字幕总数超过 12 同样返回 422
+```
+
+**提交前源被修订 → 同样 409**：第二道核对在单个 `BEGIN IMMEDIATE` 事务内与目标创建一同生效。并发地同时发起拼接与源修订时，二者被数据库写锁串行——拼接先生效则得到与各源某一完整版本一致的新场景（恒为 revision 1），修订先生效则拼接返回 409 且 `current_revision` 为新版本，绝不会把旧快照存进目标；任何失败都不创建目标、不改动源场景或播放会话。
+
 ## 播放会话（session）：播放中接纳后续修订
 
 `/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照，播放结束时一次取回最终快照并释放会话。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进、事件推进、接纳与结束按完整操作串行生效（并发请求不会交错出中间态）。接纳的完整操作包含**场景读取本身**：请求在会话锁内才读取场景快照，因此并发下每个接纳请求应用的都是轮到它生效时的快照，会话的 `source_revision` 不会被迟到的请求回退。结束的完整操作在会话锁内置墓碑并移除注册表条目：快照取自轮到结束时的会话（不读取尚未接纳的场景修订），并发结束最多一次成功，已取得会话引用但轮到它时会话已结束的请求一律 404。
@@ -615,7 +825,7 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
   - 结束**不改动源场景、其他会话或此前返回的快照**；结束不保存记录、不跨重启恢复（重启后该 id 同样 404）。场景本身仍可读取，也可基于它创建新会话。
 - 会话不存在或已结束（含服务重启后）均返回 404。
 
-### 示例 14：创建会话并推进游标
+### 示例 17：创建会话并推进游标
 
 沿用示例 6 创建的场景 `scene-001`（revision 1）：
 
@@ -665,7 +875,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 
 `active` 为游标时刻 `[start_ms, end_ms)` 内的字幕及轨道：900 时 s1（0≤900<1000）与 s2（800≤900<3000）在屏，s3（1000 才开始）不在。再次提交更小的 `time_ms` 返回 422。
 
-### 示例 15：事件推进一次跨过整条短字幕（进入与退出都不漏）
+### 示例 18：事件推进一次跨过整条短字幕（进入与退出都不漏）
 
 新建一个含短字幕的场景与会话：短字幕 `b` 只在 `[500, 600)` 出现，若播放客户端在 400 与 1000 两次采样，用 `/advance` 就完全看不到它；用 `/events` 则在跨过它的这次推进里成对拿到进入与退出。
 
@@ -739,7 +949,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 # {"session_id":"…","source_revision":1,"cursor_ms":1000,"events":[],"active":[]}
 ```
 
-### 示例 16：两个推进端点交接（共用游标，原 /advance 响应不变）
+### 示例 19：两个推进端点交接（共用游标，原 /advance 响应不变）
 
 `/advance` 与 `/events` 操作同一个会话游标，可以混用交接：客户端平时只需活动快照时用 `/advance`（响应仍是原有的 `source_revision`/`cursor_ms`/`active`，不含 `events`），需要补全跨过的进入/退出时用 `/events`。沿用示例 6 的 `scene-001`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`）：
 
@@ -794,7 +1004,7 @@ curl -s -i -X POST http://localhost:8080/sessions/no-such-session/events \
 # HTTP/1.1 404 Not Found
 ```
 
-### 示例 17：接纳修订后再事件推进（事件与轨道来自接纳后的新快照）
+### 示例 20：接纳修订后再事件推进（事件与轨道来自接纳后的新快照）
 
 下面是一段可直接复制执行的完整脚本：创建 revision 1 → 建会话并推进到 900（s1、s2 已开始）→ 场景修订为 revision 2（s3 延长到 `[1000,4000)`，新增 s4 `[3200,4000)`）→ 会话接纳 → 用 `/events` 一次推进到 4000。
 
@@ -861,7 +1071,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 
 事件与轨道全部来自**接纳后**的会话快照（s3 的 `end_ms` 已是 4000、s4 是修订新增的字幕、`source_revision` 为 2）；接纳失败（409）或尚未接纳的场景修订都不会影响事件——事件生成只读取轮到该请求生效时的会话快照，并与推进、接纳在会话锁内完整串行。4000 时刻 s3、s4 同为退出，按新快照的会话字幕顺序（s3 在 s4 前）排列。
 
-### 示例 18：播放结束——finish 取回最终快照并保存响应，随后释放会话
+### 示例 21：播放结束——finish 取回最终快照并保存响应，随后释放会话
 
 下面脚本可直接复制执行：创建场景 → 创建会话（创建响应也保存一份）→ 推进播放 → 场景被修订但**不接纳** → 结束并把**最终完整快照保存到文件** → 验证结束后一切请求 404、源场景与其他会话不受影响。
 
@@ -978,7 +1188,7 @@ curl -s -X POST http://localhost:8080/sessions \
 
 结束与同会话的推进、事件推进、接纳**串行生效**：若某操作先拿到会话锁，则它先正常生效（其游标/接纳进入最终快照），随后结束再生效；已取得会话引用但轮到它时会话已结束的请求一律 404。结束不保存任何记录、不跨重启恢复（会话本就是内存态，重启后该 id 同样 404）；此前返回的快照（`/tmp/session-create.json`、`/tmp/session-final.json`）是独立拷贝，不受任何后续操作影响。
 
-### 示例 19：播放中接纳场景修订
+### 示例 22：播放中接纳场景修订
 
 播放期间场景被修订（例如按示例 7 的方式把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`）。会话接纳最新快照：
 
@@ -1006,7 +1216,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/accept
 
 游标 900 时 s1、s2 已开始，保持原分轨 1、2 不变；s3、s4 在游标之后开始，按新快照重算分轨。`source_revision` 变为 2，场景本身的版本与内容不受接纳影响。
 
-### 示例 20：接纳冲突返回 409（会话不变）
+### 示例 23：接纳冲突返回 409（会话不变）
 
 若场景的修订动了已开始字幕（上例中游标 900 时修改了 s1 的起止时间、删除 s2、把轨道数改为 3，或新增的字幕在 900 之前开始等），接纳失败：
 
@@ -1035,7 +1245,7 @@ HTTP/1.1 409 Conflict
 
 修复后，接纳把“读取场景快照 → 校验已开始字幕 → 重算分轨 → 替换会话状态”作为**完整操作**在会话锁内串行生效：场景读取发生在轮到该请求生效之时，因此迟到的请求接纳的一定是当时的场景快照——既不会把旧数据回写到会话上，也不会跳过旧数据却报告成功。会话的 `source_revision` 对同一会话只增不回退。请求、响应与错误码（200/404/409/422）均与之前兼容。
 
-### 示例 21：并发接纳——迟到请求不会回写旧快照
+### 示例 24：并发接纳——迟到请求不会回写旧快照
 
 ```bash
 # 1) 创建场景（版本 1：未开始的 s3 end_ms=2000）
@@ -1086,7 +1296,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 #  "active":[{"id":"s2",…,"track":2},{"id":"s3",…,"end_ms":4000,…,"track":1}]}
 ```
 
-### 示例 22：临时隐藏说话人——切换、推进、接纳
+### 示例 25：临时隐藏说话人——切换、推进、接纳
 
 隐藏设置只作用于**当前会话**：不改动场景快照、分轨与其他会话，也不持久化。下面脚本可直接复制执行：创建场景 → 建会话并推进到 900 → 隐藏 Alice（s1 立即 `exit`）→ 带隐藏事件推进（Alice 的进入/退出全部消失）→ 清除隐藏 → 非法集合 422。
 
@@ -1226,9 +1436,9 @@ python tests/test_solver.py
 
 ```
 app/
-  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip 与会话结束 /sessions/{id}/finish
+  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat 与会话结束 /sessions/{id}/finish
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
-  storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段核对源版本与创建目标为同一事务）
+  storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对全部源版本与创建目标为同一事务）
   playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
@@ -1236,6 +1446,7 @@ tests/
   test_api.py            # /assign HTTP 层测试
   test_scenes.py         # 场景创建/修订/读取/版本冲突/并发测试
   test_clips.py          # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照错配回归
+  test_concat.py         # 场景拼接：时间平移/保轨/id/changes、同源重复、严格整数、轨道数/时长/字幕总数、404/409/422、原子性、提交前源修订回归
   test_playback.py       # 播放会话创建/推进/接纳/冲突/并发测试
   test_hidden_speakers.py # 临时隐藏说话人：切换事件顺序、推进/事件排除、接纳保留、快照不变、404/422、串行化
   test_finish.py         # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错

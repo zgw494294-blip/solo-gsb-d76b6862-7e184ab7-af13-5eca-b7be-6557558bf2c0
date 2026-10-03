@@ -7,6 +7,10 @@
 已存在场景须填写当前版本；服务端在一个 BEGIN IMMEDIATE 事务中
 读取当前版本并写入新版本，因此同一版本的并发提交最多一次成功，
 其余全部以 RevisionConflict 失败且不改动已有数据。
+
+片段另存（clip）与场景拼接（concat）创建新场景时同样在单个
+BEGIN IMMEDIATE 事务内核对全部源版本并占用目标：版本核对与目标
+创建一同生效，失败不留目标、不改源。
 """
 from __future__ import annotations
 
@@ -208,6 +212,89 @@ class SceneStore:
             current_revision = source_row["revision"]
             if expected_revision != current_revision:
                 raise RevisionConflict(source_scene_id, current_revision)
+
+            target_row = conn.execute(
+                "SELECT revision FROM scenes WHERE scene_id = ?",
+                (target_scene_id,),
+            ).fetchone()
+            if target_row is not None:
+                raise TargetSceneExists(
+                    target_scene_id, target_row["revision"]
+                )
+
+            conn.execute(
+                """
+                INSERT INTO scenes
+                    (scene_id, revision, track_count, subtitles, assignments, changes)
+                VALUES (?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    target_scene_id,
+                    track_count,
+                    json.dumps(subtitles, ensure_ascii=False),
+                    json.dumps(assignments, ensure_ascii=False),
+                    changes,
+                ),
+            )
+            conn.commit()
+            return SceneRecord(
+                scene_id=target_scene_id,
+                revision=1,
+                track_count=track_count,
+                subtitles=[dict(s) for s in subtitles],
+                assignments=[dict(a) for a in assignments],
+                changes=changes,
+            )
+        except (RevisionConflict, TargetSceneExists, SourceSceneMissing):
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def commit_concat(
+        self,
+        target_scene_id: str,
+        sources: List[Tuple[str, int]],
+        track_count: int,
+        subtitles: List[Dict[str, Any]],
+        assignments: List[Dict[str, Any]],
+        changes: int,
+    ) -> SceneRecord:
+        """在单个 BEGIN IMMEDIATE 事务内核对全部源版本、占用目标并写入拼接场景。
+
+        sources 为按请求段序列排列的 (scene_id, expected_revision) 列表，
+        同源可以重复。拼接结果始终以 revision=1 作为全新场景写入。
+        事务内依次完成：
+        1. 每个源场景都必须存在且 revision == 该段的 expected_revision；
+        2. target_scene_id 必须尚未被任何场景占用（包括与某个源同名）；
+        3. INSERT 目标拼接场景。
+
+        任一条件不满足都在提交前抛错回滚：失败不会留下目标，也不会改动
+        任何源场景。全部源的版本核对与目标创建被同一把写锁串行化并一同
+        生效，并发修订/拼接不会在“读到源、提交目标”之间插入过期窗口。
+
+        这是提交前的第二道版本核对：调用方（路由）在读取各源快照时已按
+        段序核对过一次，保证拼接所用数据全部取自与 expected_revision 一致
+        的完整快照；此处再核对覆盖“读取匹配后、提交前任一源被修订”的
+        窗口。返回已提交的目标场景记录（revision=1）。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # 按段序列逐个核对：404/409 的 detail 能指出具体是哪一段
+            for source_scene_id, expected_revision in sources:
+                source_row = conn.execute(
+                    "SELECT revision FROM scenes WHERE scene_id = ?",
+                    (source_scene_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise SourceSceneMissing(source_scene_id)
+                current_revision = source_row["revision"]
+                if expected_revision != current_revision:
+                    raise RevisionConflict(source_scene_id, current_revision)
 
             target_row = conn.execute(
                 "SELECT revision FROM scenes WHERE scene_id = ?",

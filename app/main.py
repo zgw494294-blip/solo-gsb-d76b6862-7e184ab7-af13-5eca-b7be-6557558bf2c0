@@ -32,7 +32,10 @@ app = FastAPI(
         "为离线对白字幕分配屏幕轨道：时间重叠的字幕不同轨，"
         "同一说话人按时间相邻字幕的换轨次数最少，并列取轨道号序列字典序最小者。"
         "场景（scene）可按 scene_id 保存修订快照，并以版本号做乐观并发控制；"
-        "已保存场景的指定时段可另存为从 0 毫秒起、保持原画面轨道的独立片段。"
+        "已保存场景的指定时段可另存为从 0 毫秒起、保持原画面轨道的独立片段；"
+        "2～4 个已保存场景还可按给定顺序拼接为连续播放场景：时间平移后按段序、"
+        "源顺序排列，id 为段号:段内序号，源分轨写入 locked_track，读取与提交时"
+        "均核对全部源版本，提交核对与目标创建一同生效，成功保存为版本 1。"
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。事件推进接口返回"
         "一次推进跨过的全部字幕进入/退出事件，短字幕不会在两次采样之间漏掉。"
@@ -42,7 +45,7 @@ app = FastAPI(
         "播放结束可通过 finish 一次取回最终完整快照并释放会话：结束与推进、"
         "事件推进、接纳、隐藏切换串行生效，结束后该会话 id 的一切请求均返回 404。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -152,6 +155,61 @@ class ClipRequest(BaseModel):
         if self.from_ms >= self.to_ms:
             raise ValueError("from_ms 必须小于 to_ms")
         return self
+
+
+class ConcatSegmentIn(BaseModel):
+    """拼接请求中的一段：引用一个已保存场景及其版本与占用时长。
+
+    整数字段使用严格整数（strict）：布尔值（true/false 会被 Python 视为
+    int 子类）与数字字符串一律按 422 拒绝，不做隐式转换。
+    """
+
+    scene_id: str = Field(..., description="本段引用的已保存场景 id：非空")
+    expected_revision: int = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description="所依据的源场景当前版本（正整数，拒绝布尔值与字符串）",
+    )
+    duration_ms: int = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description=(
+            "本段在连续播放时间轴上占用的时长（毫秒，正整数），不得小于源场景"
+            "字幕的最大 end_ms"
+        ),
+    )
+
+    @field_validator("scene_id")
+    @classmethod
+    def _scene_id_not_blank(cls, v: str) -> str:
+        if v.strip() == "":
+            raise ValueError("scene_id 不能为空")
+        return v
+
+
+class ConcatRequest(BaseModel):
+    """场景拼接请求：按给定顺序把 2～4 个已保存场景拼成连续播放场景。
+
+    各源场景可重复引用；目标 id 必须非空且尚未被占用。跨源约束
+    （轨道数一致、各段时长不小于该源最大 end_ms、字幕总数 ≤ 12）
+    在路由中读取源快照后核对，非法返回 422。
+    """
+
+    target_scene_id: str = Field(
+        ..., description="拼接结果的新场景 id：非空且尚未被占用"
+    )
+    segments: List[ConcatSegmentIn] = Field(
+        ..., min_length=2, max_length=4, description="按给定顺序排列的 2～4 段"
+    )
+
+    @field_validator("target_scene_id")
+    @classmethod
+    def _target_scene_id_not_blank(cls, v: str) -> str:
+        if v.strip() == "":
+            raise ValueError("target_scene_id 不能为空")
+        return v
 
 
 class TrackAssignment(BaseModel):
@@ -608,6 +666,183 @@ def clip_scene(scene_id: str, req: ClipRequest) -> SceneResponse:
             status_code=409,
             detail={
                 "message": "target_scene_id 已被占用，裁剪目标必须使用新的 scene_id",
+                "scene_id": exc.scene_id,
+                "current_revision": exc.current_revision,
+            },
+        )
+
+    return _record_to_scene_response(target_record)
+
+
+def _build_concat(
+    records: List[SceneRecord], durations: List[int]
+) -> tuple[List[Subtitle], List[int], int, int]:
+    """按段序把源快照拼成连续播放时间轴上的字幕并重算分轨。
+
+    跨源合法性（轨道数一致、各段 duration_ms 不小于该源最大 end_ms、
+    字幕总数 ≤ 12）在此核对，非法直接抛 422。拼接规则：
+
+    - 字幕起止时间加上之前各段 duration_ms 之和；按段序、段内源顺序排列；
+    - id 重写为“段号:段内序号”（均从 1 起），speaker 不变；
+    - 源实际分轨写入各条 locked_track，目标沿用共同 track_count 与既有
+      最少换轨、并列规则重算——源分轨在平移后仍互不冲突且与锁定一致，
+      求解结果必然等于各源画面轨道；changes 按拼接后同一说话人时间相邻
+      字幕计算换轨总数（跨段相邻也计入）。
+    返回 (字幕, 轨道, changes, track_count)。
+    """
+    track_count = records[0].track_count
+    for idx, record in enumerate(records):
+        if record.track_count != track_count:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "各源场景的轨道数（track_count）必须相同",
+                    "segment": idx + 1,
+                    "track_count": record.track_count,
+                    "expected_track_count": track_count,
+                },
+            )
+        max_end = max(
+            (s["end_ms"] for s in record.subtitles), default=0
+        )
+        if durations[idx] < max_end:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": (
+                        "duration_ms 不得小于该源场景字幕的最大 end_ms"
+                    ),
+                    "segment": idx + 1,
+                    "duration_ms": durations[idx],
+                    "max_end_ms": max_end,
+                },
+            )
+
+    total_subtitles = sum(len(record.subtitles) for record in records)
+    if total_subtitles > 12:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "拼接后的字幕总数不得超过 12",
+                "total_subtitles": total_subtitles,
+            },
+        )
+
+    subs: List[Subtitle] = []
+    offset = 0
+    for seg_idx, record in enumerate(records):
+        track_by_id = {a["id"]: a["track"] for a in record.assignments}
+        for within, s in enumerate(record.subtitles, start=1):
+            subs.append(
+                Subtitle(
+                    id=f"{seg_idx + 1}:{within}",
+                    speaker=s["speaker"],
+                    start_ms=s["start_ms"] + offset,
+                    end_ms=s["end_ms"] + offset,
+                    locked_track=track_by_id[s["id"]],
+                )
+            )
+        offset += durations[seg_idx]
+
+    tracks, changes = solve(subs, track_count)
+    if tracks is None:  # 理论不可达：各源分轨平移后仍是互不冲突的合法解
+        raise RuntimeError("拼接场景在固定各源分轨后无解")
+    return subs, tracks, changes, track_count
+
+
+@app.post("/scenes/concat", response_model=SceneResponse)
+def concat_scenes(req: ConcatRequest) -> SceneResponse:
+    """按给定顺序把 2～4 个已保存场景拼成连续播放场景。
+
+    各段给出非空 scene_id、正整数 expected_revision 与正整数
+    duration_ms；同一个源场景可以重复出现。读取源快照时按段序逐一
+    核对存在性与版本：源不存在返回 404，版本不符返回 409。随后核对
+    跨源约束：各源 track_count 必须相同、每段 duration_ms 不得小于
+    该源字幕的最大 end_ms、拼接后字幕总数 ≤ 12，否则 422。
+
+    拼接结果的字幕起止时间加上之前各段 duration_ms 之和，按段序、
+    段内源顺序排列；id 为“段号:段内序号”（均从 1 起），speaker
+    不变，源实际分轨写入 locked_track，目标沿用共同轨道数重算，
+    changes 按拼接后同一说话人时间相邻字幕统计（跨段相邻计入）。
+
+    提交核对与目标创建在同一个 BEGIN IMMEDIATE 事务内一同生效：
+    事务内再核对全部源版本并确认目标未占用，任一失败都回滚——失败
+    不留目标，不改任何源场景或播放会话。成功保存为 revision=1 的
+    全新场景并返回完整快照，可直接用既有 GET/PUT /scenes/... 与
+    /sessions 读取、修订与播放，旧接口不变。
+    """
+    store = get_store()
+    records: List[SceneRecord] = []
+    # 读取即核对：按段序逐个读取，拼接所用的字幕与源分轨全部取自与各段
+    # expected_revision 一致的完整快照；不存在 404、版本不符立即 409，
+    # 绝不拿错配版本拼接。
+    for idx, segment in enumerate(req.segments):
+        record = store.get_scene(segment.scene_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"场景 {segment.scene_id!r} 不存在",
+            )
+        if record.revision != segment.expected_revision:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "场景版本冲突：expected_revision 与当前版本不一致"
+                    ),
+                    "scene_id": segment.scene_id,
+                    "segment": idx + 1,
+                    "current_revision": record.revision,
+                },
+            )
+        records.append(record)
+
+    durations = [segment.duration_ms for segment in req.segments]
+    subs, tracks, changes, track_count = _build_concat(records, durations)
+
+    subtitles_data = [
+        {
+            "id": s.id,
+            "speaker": s.speaker,
+            "start_ms": s.start_ms,
+            "end_ms": s.end_ms,
+            "locked_track": s.locked_track,
+        }
+        for s in subs
+    ]
+    assignments_data = [
+        {"id": s.id, "track": t} for s, t in zip(subs, tracks)
+    ]
+
+    try:
+        target_record = store.commit_concat(
+            target_scene_id=req.target_scene_id,
+            sources=[
+                (segment.scene_id, segment.expected_revision)
+                for segment in req.segments
+            ],
+            track_count=track_count,
+            subtitles=subtitles_data,
+            assignments=assignments_data,
+            changes=changes,
+        )
+    except SourceSceneMissing:
+        # 源在读取后、事务内被删除（正常流程中场景不可删除）：按 404 处理
+        raise HTTPException(status_code=404, detail="源场景不存在")
+    except RevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "场景版本冲突：expected_revision 与当前版本不一致",
+                "scene_id": exc.scene_id,
+                "current_revision": exc.current_revision,
+            },
+        )
+    except TargetSceneExists as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "target_scene_id 已被占用，拼接目标必须使用新的 scene_id",
                 "scene_id": exc.scene_id,
                 "current_revision": exc.current_revision,
             },
