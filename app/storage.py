@@ -44,7 +44,7 @@ class TargetSceneExists(Exception):
 
 
 class SourceSceneMissing(Exception):
-    """提交裁剪事务时发现源场景不存在（正常流程中场景不可删除，仅作防御）。"""
+    """提交拼接/裁剪事务时发现源场景不存在（正常流程中场景不可删除，仅作防御）。"""
 
     def __init__(self, scene_id: str) -> None:
         self.scene_id = scene_id
@@ -208,6 +208,87 @@ class SceneStore:
             current_revision = source_row["revision"]
             if expected_revision != current_revision:
                 raise RevisionConflict(source_scene_id, current_revision)
+
+            target_row = conn.execute(
+                "SELECT revision FROM scenes WHERE scene_id = ?",
+                (target_scene_id,),
+            ).fetchone()
+            if target_row is not None:
+                raise TargetSceneExists(
+                    target_scene_id, target_row["revision"]
+                )
+
+            conn.execute(
+                """
+                INSERT INTO scenes
+                    (scene_id, revision, track_count, subtitles, assignments, changes)
+                VALUES (?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    target_scene_id,
+                    track_count,
+                    json.dumps(subtitles, ensure_ascii=False),
+                    json.dumps(assignments, ensure_ascii=False),
+                    changes,
+                ),
+            )
+            conn.commit()
+            return SceneRecord(
+                scene_id=target_scene_id,
+                revision=1,
+                track_count=track_count,
+                subtitles=[dict(s) for s in subtitles],
+                assignments=[dict(a) for a in assignments],
+                changes=changes,
+            )
+        except (RevisionConflict, TargetSceneExists, SourceSceneMissing):
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def commit_stitch(
+        self,
+        sources: List[Tuple[str, int]],
+        target_scene_id: str,
+        track_count: int,
+        subtitles: List[Dict[str, Any]],
+        assignments: List[Dict[str, Any]],
+        changes: int,
+    ) -> SceneRecord:
+        """在单个 BEGIN IMMEDIATE 事务内核对全部源版本、占用目标并写入拼接场景。
+
+        sources 按请求段序列出 (scene_id, expected_revision)，同一场景可
+        重复出现，每个位置都必须在事务内重新核对。拼接结果始终以
+        revision=1 作为全新场景写入。事务内依次完成：
+        1. 每个源（按段序，含重复项）必须存在且 revision 等于该段的
+           expected_revision；
+        2. target_scene_id 必须尚未被任何场景占用（包括与某源同名）；
+        3. INSERT 目标拼接场景。
+
+        任一条件不满足都在提交前抛错回滚：失败不会留下目标，也不会改动
+        任何源场景。这是提交前的第二道版本核对：调用方（路由）在读取各
+        源快照时已先核对过一次，保证拼接所用数据取自与 expected_revision
+        一致的完整快照；此处再核对覆盖“读取匹配后、提交前源被修订”的
+        窗口。源不存在以 SourceSceneMissing 抛出，由路由映射为 404。
+        返回已提交的目标场景记录（revision=1）。
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for source_scene_id, expected_revision in sources:
+                source_row = conn.execute(
+                    "SELECT revision FROM scenes WHERE scene_id = ?",
+                    (source_scene_id,),
+                ).fetchone()
+                if source_row is None:
+                    raise SourceSceneMissing(source_scene_id)
+                current_revision = source_row["revision"]
+                if expected_revision != current_revision:
+                    raise RevisionConflict(source_scene_id, current_revision)
 
             target_row = conn.execute(
                 "SELECT revision FROM scenes WHERE scene_id = ?",

@@ -9,6 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；裁剪数据全部取自与 `expected_revision` 一致的**同一份完整源快照**——读取快照时先核对版本（不符立即 409，绝不拿错配版本裁剪），提交前在同一事务内再核对一次（读取匹配后源被修订同样 409），目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422；失败不创建目标、不改源场景或播放会话。
+- 已保存场景还可按给定顺序**拼接（stitch）**为连续播放场景：`POST /stitch` 接收非空 `target_scene_id` 与 2～4 段（每段给出非空 `scene_id`、正整数 `expected_revision` 与 `duration_ms`，整数字段拒绝布尔值和字符串，同一场景可重复出现）；各源轨道数须相同、每段时长不得小于该源最大 `end_ms`、拼接后字幕总数 ≤ 12，否则 422。字幕起止时间加上之前各段时长之和，按段序、源顺序排列，id 重写为“段号:段内序号”（均从 1 起），speaker 不变，源实际轨道写入 `locked_track`；读取与提交时均核对全部源版本，提交核对与目标创建在同一事务内一同生效——源不存在 404、版本不符或目标已占用 409；失败不留目标、不改源及播放会话。拼接结果保存为 revision 1 的完整场景，可直接读取、修订与播放。
 - 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放时还可通过 `/hidden_speakers` **临时隐藏指定说话人的字幕（仅影响该会话、不持久化）**：按 `speaker` 精确匹配，提交无重复非空字符串数组（空数组清除，允许尚未出现者）；切换时以当前游标的左闭右开活动区间判定，原可见而现隐藏者发 `exit`、原隐藏而现可见者发 `enter`（时刻为当前游标，先 `exit` 后 `enter`，同类按会话字幕顺序，无变化则无事件）；设置后推进与事件推进的活动字幕、事件均排除隐藏者而游标照常推进，隐藏默认空、接纳后保留，完整快照与分轨不受影响。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、隐藏切换、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 
 ## 一条命令启动
@@ -580,6 +581,193 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
 
 片段时间轴从 0 开始：s1 在 100 毫秒退出与 s3 在 100 毫秒进入同刻，按既有规则**先退出后进入**；s1、s2 在 0 毫秒已活动，其进入事件由创建会话的响应快照确定，事件流不补发。片段还可以按 `expected_revision: 1` 用 `PUT /scenes/scene-clip-1` 继续修订（成功后 revision 2），与源场景互不影响。
 
+## 场景拼接（stitch）：按顺序把已保存场景拼成连续播放场景
+
+`POST /stitch` 按请求中**给定的段序**把 **2～4 个已保存场景**首尾相接成一个**连续播放场景**：第 k 段字幕的起止时间加上之前各段 `duration_ms` 之和。拼接结果保存为 **revision 1** 的全新场景，与裁剪一样，源场景与任何播放会话都不受影响，失败不留目标。
+
+请求体：
+
+```json
+{
+  "target_scene_id": "scene-feature",
+  "segments": [
+    {"scene_id": "scene-a", "expected_revision": 1, "duration_ms": 3000},
+    {"scene_id": "scene-b", "expected_revision": 1, "duration_ms": 2000}
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `target_scene_id` | string | 拼接结果的新场景 id，**非空且尚未被占用**（不能与已有场景同名，包括与某源同名） |
+| `segments` | array | **2～4 段**，段序即播放序；同一场景可在序列中**重复出现**，每段独立核对版本 |
+| `segments[].scene_id` | string | 源场景 id，非空字符串（数字/布尔不做隐式转换） |
+| `segments[].expected_revision` | int | **正整数**，所依据的该源当前版本；**布尔值与字符串一律 422 拒绝** |
+| `segments[].duration_ms` | int | **正整数**，该段在连续时间轴上占用的毫秒数；**不得小于该源场景字幕的最大 `end_ms`**（允许更大，段间留出静音间隔）；同样拒绝布尔值与字符串 |
+
+拼接规则：
+
+- **全部源的 `track_count` 必须相同**，否则 422；拼接后**字幕总数 ≤ 12**（各源字幕数之和），否则 422。
+- 字幕按**段序、段内源顺序**排列：起止时间加上之前各段 `duration_ms` 之和；`id` 一律重写为 **`"段号:段内序号"`**（均从 1 起，例如第二段第三条为 `"2:3"`），`speaker` 保持不变。
+- 源场景为每条字幕求出的**实际轨道**写入拼接字幕的 `locked_track`，目标沿用各源共同的 `track_count` 与既有最少换轨、并列规则重算——各源分轨平移后互不冲突且与锁轨一致，因此 `assignments` 与**源画面轨道逐一相同**；`changes` 按**拼接后**同一说话人时间相邻字幕计算（跨段相邻也计入）。
+- 结果保存为 **revision 1** 的独立场景，返回完整快照，可用既有 `GET/PUT /scenes/...` 与 `/sessions` 读取、修订、播放。
+
+版本核对与裁剪同样分两道：**依次读取每个源快照时**（同源重复的每段各读一次）先核对 `record.revision == expected_revision`，不符立即 409，绝不拿错配快照拼接；**提交前**在同一个 `BEGIN IMMEDIATE` 事务内再核对全部源版本并占用目标——**提交核对和目标创建一同生效**，覆盖“读取匹配后、提交前某源被修订”的窗口。状态码：
+
+- **200**：拼接成功，返回 revision 1 的完整场景。
+- **404**：任一源场景不存在（按段序遇到的第一个缺失源，detail 中给出 `segment`）。
+- **409**：某段 `expected_revision` 与源当前版本不一致（过期与超前同等待遇）；或 `target_scene_id` 已被占用。失败不留目标、不改源、不动播放会话。
+- **422**：其余非法输入：段数不在 2～4、整数字段为布尔/字符串/浮点/非正数、`scene_id` 或 `target_scene_id` 为空、各源轨道数不同、某段 `duration_ms` 小于该源最大 `end_ms`、拼接后字幕总数超过 12 等。
+
+### 示例 14：拼接两段并连续播放（含 404 / 409 / 422 冲突）
+
+先创建两个源场景。`scene-stitch-a` 为 2 轨：a1 Alice `[0,1000)`、a2 Bob `[800,3000)` 锁轨 2、a3 Alice `[1000,2500)`，分轨 1/2/1（最大 `end_ms` 3000）；`scene-stitch-b` 为 2 轨：b1 Carol `[0,500)`、b2 Alice `[0,2000)`（最大 `end_ms` 2000）：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-stitch-a \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "a1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "a2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "a3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+curl -s -X PUT http://localhost:8080/scenes/scene-stitch-b \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "b1", "speaker": "Carol", "start_ms": 0, "end_ms": 500},
+      {"id": "b2", "speaker": "Alice", "start_ms": 0, "end_ms": 2000}
+    ]
+  }' >/dev/null
+```
+
+按 a（时长 3000）→ b（时长 2000）拼成 `scene-feature`：
+
+```bash
+curl -s -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_scene_id": "scene-feature",
+    "segments": [
+      {"scene_id": "scene-stitch-a", "expected_revision": 1, "duration_ms": 3000},
+      {"scene_id": "scene-stitch-b", "expected_revision": 1, "duration_ms": 2000}
+    ]
+  }'
+```
+
+```json
+{
+  "scene_id": "scene-feature",
+  "revision": 1,
+  "track_count": 2,
+  "subtitles": [
+    {"id": "1:1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000, "locked_track": 1},
+    {"id": "1:2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "1:3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500, "locked_track": 1},
+    {"id": "2:1", "speaker": "Carol", "start_ms": 3000, "end_ms": 3500, "locked_track": 1},
+    {"id": "2:2", "speaker": "Alice", "start_ms": 3000, "end_ms": 5000, "locked_track": 2}
+  ],
+  "changes": 1,
+  "assignments": [
+    {"id": "1:1", "track": 1},
+    {"id": "1:2", "track": 2},
+    {"id": "1:3", "track": 1},
+    {"id": "2:1", "track": 1},
+    {"id": "2:2", "track": 2}
+  ],
+  "feasible": true
+}
+```
+
+要点：第二段整体平移 3000；id 全部重写为 `"段号:段内序号"`；每条 `locked_track` 都是该字幕在源里的实际轨道，`assignments` 与源画面轨道逐一相同；Alice 按时间相邻的链是 `1:1`(轨1) → `1:3`(轨1) → `2:2`(轨2)，跨段恰好一次换轨，`changes` 为 1。
+
+拼接结果就是普通场景，直接用既有接口播放连续时间轴（b1/b2 在 3000 毫秒进入、b1 在 3500 退出、b2 在 5000 退出）：
+
+```bash
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-feature"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3500}'
+```
+
+```json
+{"session_id":"…","source_revision":1,"cursor_ms":3500,
+ "events":[
+   {"id":"1:2","speaker":"Bob","track":2,"time_ms":800,"type":"enter"},
+   {"id":"1:1","speaker":"Alice","track":1,"time_ms":1000,"type":"exit"},
+   {"id":"1:3","speaker":"Alice","track":1,"time_ms":1000,"type":"enter"},
+   {"id":"1:3","speaker":"Alice","track":1,"time_ms":2500,"type":"exit"},
+   {"id":"1:2","speaker":"Bob","track":2,"time_ms":3000,"type":"exit"},
+   {"id":"2:1","speaker":"Carol","track":1,"time_ms":3000,"type":"enter"},
+   {"id":"2:2","speaker":"Alice","track":2,"time_ms":3000,"type":"enter"},
+   {"id":"2:1","speaker":"Carol","track":1,"time_ms":3500,"type":"exit"}
+ ],
+ "active":[{"id":"2:2","speaker":"Alice","start_ms":3000,"end_ms":5000,"locked_track":2,"track":2}]}
+```
+
+**冲突与非法输入**（任何失败都不创建 `scene-feature-*`，源与播放会话不变）：
+
+```bash
+# 源不存在 -> 404（detail 给出段号 segment 与 scene_id）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id":"scene-e1","segments":[
+        {"scene_id":"no-such-scene","expected_revision":1,"duration_ms":100},
+        {"scene_id":"scene-stitch-a","expected_revision":1,"duration_ms":3000}]}'
+# 404
+
+# 源版本不符（过期或超前）-> 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id":"scene-e2","segments":[
+        {"scene_id":"scene-stitch-a","expected_revision":2,"duration_ms":3000},
+        {"scene_id":"scene-stitch-b","expected_revision":1,"duration_ms":2000}]}'
+# 409
+
+# 目标已被占用（与已有场景同名，含与源同名）-> 409
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id":"scene-stitch-b","segments":[
+        {"scene_id":"scene-stitch-a","expected_revision":1,"duration_ms":3000},
+        {"scene_id":"scene-stitch-a","expected_revision":1,"duration_ms":3000}]}'
+# 409
+
+# duration_ms 小于该源最大 end_ms（3000）-> 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id":"scene-e3","segments":[
+        {"scene_id":"scene-stitch-a","expected_revision":1,"duration_ms":2999},
+        {"scene_id":"scene-stitch-b","expected_revision":1,"duration_ms":2000}]}'
+# 422
+
+# 整数字段拒绝布尔值（true 不是整数 1）与字符串
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id":"scene-e4","segments":[
+        {"scene_id":"scene-stitch-a","expected_revision":true,"duration_ms":3000},
+        {"scene_id":"scene-stitch-b","expected_revision":1,"duration_ms":"2000"}]}'
+# 422
+
+# 段数必须为 2～4（下面只有 1 段）-> 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/stitch \
+  -H 'Content-Type: application/json' \
+  -d '{"target_scene_id":"scene-e5","segments":[
+        {"scene_id":"scene-stitch-a","expected_revision":1,"duration_ms":3000}]}'
+# 422
+```
+
+版本冲突的正确处理与裁剪相同：先 `GET` 各源取得当前 `revision`，再用新的 `expected_revision` 重试；拼接结果可继续 `PUT` 修订（`expected_revision: 1`，成功后 revision 2），与各源场景互不影响。并发拼接与源修订被数据库写锁串行：拼接先生效则结果与某一完整版本一致（恒为 revision 1），源修订先生效则拼接返回 409 且无目标残留。
+
 ## 播放会话（session）：播放中接纳后续修订
 
 `/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照，播放结束时一次取回最终快照并释放会话。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进、事件推进、接纳与结束按完整操作串行生效（并发请求不会交错出中间态）。接纳的完整操作包含**场景读取本身**：请求在会话锁内才读取场景快照，因此并发下每个接纳请求应用的都是轮到它生效时的快照，会话的 `source_revision` 不会被迟到的请求回退。结束的完整操作在会话锁内置墓碑并移除注册表条目：快照取自轮到结束时的会话（不读取尚未接纳的场景修订），并发结束最多一次成功，已取得会话引用但轮到它时会话已结束的请求一律 404。
@@ -615,7 +803,7 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
   - 结束**不改动源场景、其他会话或此前返回的快照**；结束不保存记录、不跨重启恢复（重启后该 id 同样 404）。场景本身仍可读取，也可基于它创建新会话。
 - 会话不存在或已结束（含服务重启后）均返回 404。
 
-### 示例 14：创建会话并推进游标
+### 示例 15：创建会话并推进游标
 
 沿用示例 6 创建的场景 `scene-001`（revision 1）：
 
@@ -665,7 +853,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 
 `active` 为游标时刻 `[start_ms, end_ms)` 内的字幕及轨道：900 时 s1（0≤900<1000）与 s2（800≤900<3000）在屏，s3（1000 才开始）不在。再次提交更小的 `time_ms` 返回 422。
 
-### 示例 15：事件推进一次跨过整条短字幕（进入与退出都不漏）
+### 示例 16：事件推进一次跨过整条短字幕（进入与退出都不漏）
 
 新建一个含短字幕的场景与会话：短字幕 `b` 只在 `[500, 600)` 出现，若播放客户端在 400 与 1000 两次采样，用 `/advance` 就完全看不到它；用 `/events` 则在跨过它的这次推进里成对拿到进入与退出。
 
@@ -739,7 +927,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 # {"session_id":"…","source_revision":1,"cursor_ms":1000,"events":[],"active":[]}
 ```
 
-### 示例 16：两个推进端点交接（共用游标，原 /advance 响应不变）
+### 示例 17：两个推进端点交接（共用游标，原 /advance 响应不变）
 
 `/advance` 与 `/events` 操作同一个会话游标，可以混用交接：客户端平时只需活动快照时用 `/advance`（响应仍是原有的 `source_revision`/`cursor_ms`/`active`，不含 `events`），需要补全跨过的进入/退出时用 `/events`。沿用示例 6 的 `scene-001`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`）：
 
@@ -794,7 +982,7 @@ curl -s -i -X POST http://localhost:8080/sessions/no-such-session/events \
 # HTTP/1.1 404 Not Found
 ```
 
-### 示例 17：接纳修订后再事件推进（事件与轨道来自接纳后的新快照）
+### 示例 18：接纳修订后再事件推进（事件与轨道来自接纳后的新快照）
 
 下面是一段可直接复制执行的完整脚本：创建 revision 1 → 建会话并推进到 900（s1、s2 已开始）→ 场景修订为 revision 2（s3 延长到 `[1000,4000)`，新增 s4 `[3200,4000)`）→ 会话接纳 → 用 `/events` 一次推进到 4000。
 
@@ -861,7 +1049,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 
 事件与轨道全部来自**接纳后**的会话快照（s3 的 `end_ms` 已是 4000、s4 是修订新增的字幕、`source_revision` 为 2）；接纳失败（409）或尚未接纳的场景修订都不会影响事件——事件生成只读取轮到该请求生效时的会话快照，并与推进、接纳在会话锁内完整串行。4000 时刻 s3、s4 同为退出，按新快照的会话字幕顺序（s3 在 s4 前）排列。
 
-### 示例 18：播放结束——finish 取回最终快照并保存响应，随后释放会话
+### 示例 19：播放结束——finish 取回最终快照并保存响应，随后释放会话
 
 下面脚本可直接复制执行：创建场景 → 创建会话（创建响应也保存一份）→ 推进播放 → 场景被修订但**不接纳** → 结束并把**最终完整快照保存到文件** → 验证结束后一切请求 404、源场景与其他会话不受影响。
 
@@ -978,7 +1166,7 @@ curl -s -X POST http://localhost:8080/sessions \
 
 结束与同会话的推进、事件推进、接纳**串行生效**：若某操作先拿到会话锁，则它先正常生效（其游标/接纳进入最终快照），随后结束再生效；已取得会话引用但轮到它时会话已结束的请求一律 404。结束不保存任何记录、不跨重启恢复（会话本就是内存态，重启后该 id 同样 404）；此前返回的快照（`/tmp/session-create.json`、`/tmp/session-final.json`）是独立拷贝，不受任何后续操作影响。
 
-### 示例 19：播放中接纳场景修订
+### 示例 20：播放中接纳场景修订
 
 播放期间场景被修订（例如按示例 7 的方式把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`）。会话接纳最新快照：
 
@@ -1006,7 +1194,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/accept
 
 游标 900 时 s1、s2 已开始，保持原分轨 1、2 不变；s3、s4 在游标之后开始，按新快照重算分轨。`source_revision` 变为 2，场景本身的版本与内容不受接纳影响。
 
-### 示例 20：接纳冲突返回 409（会话不变）
+### 示例 21：接纳冲突返回 409（会话不变）
 
 若场景的修订动了已开始字幕（上例中游标 900 时修改了 s1 的起止时间、删除 s2、把轨道数改为 3，或新增的字幕在 900 之前开始等），接纳失败：
 
@@ -1035,7 +1223,7 @@ HTTP/1.1 409 Conflict
 
 修复后，接纳把“读取场景快照 → 校验已开始字幕 → 重算分轨 → 替换会话状态”作为**完整操作**在会话锁内串行生效：场景读取发生在轮到该请求生效之时，因此迟到的请求接纳的一定是当时的场景快照——既不会把旧数据回写到会话上，也不会跳过旧数据却报告成功。会话的 `source_revision` 对同一会话只增不回退。请求、响应与错误码（200/404/409/422）均与之前兼容。
 
-### 示例 21：并发接纳——迟到请求不会回写旧快照
+### 示例 22：并发接纳——迟到请求不会回写旧快照
 
 ```bash
 # 1) 创建场景（版本 1：未开始的 s3 end_ms=2000）
@@ -1086,7 +1274,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 #  "active":[{"id":"s2",…,"track":2},{"id":"s3",…,"end_ms":4000,…,"track":1}]}
 ```
 
-### 示例 22：临时隐藏说话人——切换、推进、接纳
+### 示例 23：临时隐藏说话人——切换、推进、接纳
 
 隐藏设置只作用于**当前会话**：不改动场景快照、分轨与其他会话，也不持久化。下面脚本可直接复制执行：创建场景 → 建会话并推进到 900 → 隐藏 Alice（s1 立即 `exit`）→ 带隐藏事件推进（Alice 的进入/退出全部消失）→ 清除隐藏 → 非法集合 422。
 
@@ -1226,9 +1414,9 @@ python tests/test_solver.py
 
 ```
 app/
-  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip 与会话结束 /sessions/{id}/finish
+  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /stitch 与会话结束 /sessions/{id}/finish
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
-  storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段核对源版本与创建目标为同一事务）
+  storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对源版本与创建目标为同一事务）
   playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
@@ -1236,6 +1424,7 @@ tests/
   test_api.py            # /assign HTTP 层测试
   test_scenes.py         # 场景创建/修订/读取/版本冲突/并发测试
   test_clips.py          # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照错配回归
+  test_stitch.py         # 场景拼接：时间平移/段序/id 重写/保轨/跨段 changes、同源重复、404/409/422、严格整数、原子性、快照错配回归
   test_playback.py       # 播放会话创建/推进/接纳/冲突/并发测试
   test_hidden_speakers.py # 临时隐藏说话人：切换事件顺序、推进/事件排除、接纳保留、快照不变、404/422、串行化
   test_finish.py         # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
